@@ -1,4 +1,5 @@
 import { useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { getHfReply, type HfChatMessage } from './services/hfService'
 import './App.css'
 
 type Topic = {
@@ -11,6 +12,7 @@ type Message = {
   id: number
   role: 'assistant' | 'user'
   text: string
+  isError?: boolean
 }
 
 function App() {
@@ -20,14 +22,61 @@ function App() {
   const [messagesByTopic, setMessagesByTopic] = useState<
     Record<number, Message[]>
   >({})
+  const [generatingTopicIds, setGeneratingTopicIds] = useState<number[]>([])
   const [messageDraft, setMessageDraft] = useState('')
   const nextId = useRef(0)
+  const inFlightTopicIds = useRef(new Set<number>())
 
   const activeTopic = topics.find((topic) => topic.id === activeTopicId)
   const completedCount = topics.filter((topic) => topic.progress === 100).length
   const activeMessages = activeTopicId !== null
     ? messagesByTopic[activeTopicId] ?? []
     : []
+  const isActiveGenerating =
+    activeTopicId !== null && generatingTopicIds.includes(activeTopicId)
+
+  async function requestTutorReply(topic: Topic, history: Message[]) {
+    if (inFlightTopicIds.current.has(topic.id)) return
+
+    inFlightTopicIds.current.add(topic.id)
+    setGeneratingTopicIds((currentIds) => [...currentIds, topic.id])
+
+    try {
+      const conversation: HfChatMessage[] = history
+        .filter((message) => !message.isError)
+        .map(({ role, text }) => ({ role, content: text }))
+      const reply = await getHfReply(topic.name, conversation)
+      setMessagesByTopic((currentMessages) => ({
+        ...currentMessages,
+        [topic.id]: [
+          ...(currentMessages[topic.id] ?? []),
+          { id: nextId.current++, role: 'assistant', text: reply },
+        ],
+      }))
+    } catch (error) {
+      const errorText =
+        error instanceof Error
+          ? error.message
+          : 'Wystąpił nieoczekiwany błąd. Spróbuj ponownie.'
+      setMessagesByTopic((currentMessages) => ({
+        ...currentMessages,
+        [topic.id]: [
+          ...(currentMessages[topic.id] ?? []),
+          {
+            id: nextId.current++,
+            role: 'assistant',
+            text: errorText,
+            isError: true,
+          },
+        ],
+      }))
+    } finally {
+      inFlightTopicIds.current.delete(topic.id)
+      setGeneratingTopicIds((currentIds) =>
+        currentIds.filter((id) => id !== topic.id),
+      )
+    }
+  }
 
   function startLearning(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -45,23 +94,19 @@ function App() {
       name,
       progress: 0,
     }))
-    const initialMessages = Object.fromEntries(
-      newTopics.map((topic) => [
-        topic.id,
-        [
-          {
-            id: nextId.current++,
-            role: 'assistant' as const,
-            text: `Zacznijmy od tematu: ${topic.name}. Co już o nim wiesz?`,
-          },
-        ],
-      ]),
-    )
-
     setTopics(newTopics)
-    setMessagesByTopic(initialMessages)
+    setMessagesByTopic(Object.fromEntries(newTopics.map((topic) => [topic.id, []])))
     setActiveTopicId(newTopics[0].id)
     setMessageDraft('')
+    void requestTutorReply(newTopics[0], [])
+  }
+
+  function selectTopic(topic: Topic) {
+    setActiveTopicId(topic.id)
+    const history = messagesByTopic[topic.id] ?? []
+    if (history.length === 0) {
+      void requestTutorReply(topic, history)
+    }
   }
 
   function markTopicMastered() {
@@ -76,7 +121,12 @@ function App() {
   function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const text = messageDraft.trim()
-    if (!text || activeTopicId === null) return
+    if (
+      !text ||
+      activeTopicId === null ||
+      !activeTopic ||
+      inFlightTopicIds.current.has(activeTopicId)
+    ) return
 
     const newMessage: Message = {
       id: nextId.current++,
@@ -89,6 +139,7 @@ function App() {
       [activeTopicId]: [...(currentMessages[activeTopicId] ?? []), newMessage],
     }))
     setMessageDraft('')
+    void requestTutorReply(activeTopic, [...activeMessages, newMessage])
   }
 
   function handleMessageKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -138,7 +189,7 @@ function App() {
                   <button
                     className={`topic-item${topic.id === activeTopicId ? ' is-active' : ''}`}
                     type="button"
-                    onClick={() => setActiveTopicId(topic.id)}
+                    onClick={() => selectTopic(topic)}
                     aria-current={topic.id === activeTopicId ? 'true' : undefined}
                   >
                     <span className="topic-item-top">
@@ -190,7 +241,7 @@ function App() {
         </header>
 
         <div className="chat-area" aria-live="polite">
-          {activeMessages.length > 0 ? (
+          {activeMessages.length > 0 || isActiveGenerating ? (
             <div className="messages">
               {activeMessages.map((message) => (
                 <article
@@ -203,6 +254,12 @@ function App() {
                   <p>{message.text}</p>
                 </article>
               ))}
+              {isActiveGenerating && (
+                <article className="message message-assistant">
+                  <span className="assistant-avatar" aria-hidden="true">S</span>
+                  <p>Studybot pisze...</p>
+                </article>
+              )}
             </div>
           ) : (
             <div className="welcome">
@@ -235,7 +292,7 @@ function App() {
             className="send-button"
             type="submit"
             aria-label="Wyślij wiadomość"
-            disabled={!activeTopic || !messageDraft.trim()}
+            disabled={!activeTopic || !messageDraft.trim() || isActiveGenerating}
           >
             <svg viewBox="0 0 20 20" aria-hidden="true">
               <path d="M3.5 10h12m-5-5 5 5-5 5" />
